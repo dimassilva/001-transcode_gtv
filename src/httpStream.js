@@ -1,6 +1,9 @@
 import http from "node:http";
 import https from "node:https";
+import fs from "node:fs";
+import path from "node:path";
 import { URL } from "node:url";
+import { stat } from "node:fs/promises";
 import WebTorrent from "webtorrent";
 
 // --- SEGURO DE VIDA DO SERVIDOR ---
@@ -132,6 +135,14 @@ export async function getGenericStream(inputUrl, options = {}, videoFileName = n
     } else {
         throw new Error("Protocolo não suportado (apenas http, https ou magnet)");
     }
+}
+
+export async function getLocalFileStream(filePath) {
+    const absPath = path.resolve(filePath);
+    const info = await stat(absPath);
+    const stream = fs.createReadStream(absPath);
+    stream.fileData = { name: path.basename(absPath), length: info.size };
+    return stream;
 }
 
 // Função para listar arquivos de vídeo no torrent (para seleção em séries)

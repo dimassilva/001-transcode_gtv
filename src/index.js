@@ -16,7 +16,7 @@ import { nanoid } from "nanoid";
 import multer from "multer";
 import fs from "node:fs/promises";
 
-import { getGenericStream } from "./httpStream.js"; 
+import { getGenericStream, getLocalFileStream } from "./httpStream.js"; 
 import { probeAndReplayFromReadable } from "./probeStream.js";
 import { runTranscodeJob } from "./jobRunner.js";
 
@@ -75,12 +75,28 @@ app.post("/api/probe-url", async (req, res) => {
   }
 });
 
+app.post("/api/probe-file", upload.single("sourceFile"), async (req, res) => {
+  try {
+    if (!req.file?.path) return res.status(400).json({ error: "arquivo obrigatório" });
+    const stream = await getLocalFileStream(req.file.path);
+    const { probe } = await probeAndReplayFromReadable({ inputReadable: stream, ffprobePath: FFPROBE });
+    stream.destroy();
+    res.json({ probe });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message) });
+  } finally {
+    if (req.file?.path) {
+      try { await fs.rm(req.file.path, { force: true }); } catch {}
+    }
+  }
+});
+
 // --- ROTA DE JOB COM UPLOAD ---
 // upload.any() permite receber qualquer arquivo enviado pelo front
 app.post("/api/jobs", upload.any(), async (req, res) => {
   try {
     // Como é FormData, tudo vem como string. Precisamos fazer o Parse.
-    const url = req.body.url;
+    const url = req.body.url || null;
     const meta = JSON.parse(req.body.meta);
     const selectedAudios = JSON.parse(req.body.selectedAudios);
     // Legendas internas (do torrent)
@@ -91,17 +107,24 @@ app.post("/api/jobs", upload.any(), async (req, res) => {
 
     // Processa Legendas EXTERNAS (Upload)
     const externalSubs = [];
+    let localFilePath = null;
     if (req.files && req.files.length > 0) {
-        req.files.forEach(file => {
-            // O front manda o campo com nome tipo "extSub_pt" ou "extSub_en"
-            // Pegamos o idioma do nome do campo
-            const lang = file.fieldname.split('_')[1] || 'und';
-            externalSubs.push({
-                path: file.path, // Caminho temporário do SRT
-                lang: lang,
-                name: lang === 'pt' ? 'Portugues (Ext)' : 'Ingles (Ext)'
-            });
+      req.files.forEach(file => {
+        if (file.fieldname === "sourceFile") {
+          localFilePath = file.path;
+          return;
+        }
+        if (!file.fieldname.startsWith("extSub_")) return;
+
+        // O front manda o campo com nome tipo "extSub_pt" ou "extSub_en"
+        // Pegamos o idioma do nome do campo
+        const lang = file.fieldname.split('_')[1] || 'und';
+        externalSubs.push({
+          path: file.path, // Caminho temporário do SRT
+          lang: lang,
+          name: lang === 'pt' ? 'Portugues (Ext)' : 'Ingles (Ext)'
         });
+      });
     }
 
     // Lógica de Pastas R2
@@ -132,6 +155,7 @@ app.post("/api/jobs", upload.any(), async (req, res) => {
           selectedSubs,
           externalSubs, // <--- PASSANDO AS EXTERNAS
           videoFile, // <--- PASSANDO O ARQUIVO SELECIONADO (para séries)
+          localFilePath,
           r2DestFolder: r2Path,
           hlsTime: 15,
           thumbsEvery: 10,
