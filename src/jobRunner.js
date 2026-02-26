@@ -229,6 +229,25 @@ async function upsertToSupabase({ meta, r2Prefix, r2PublicBase, duration, has4k 
   const isSerie = meta.type === "serie" || meta.type === "series";
 
   if (isSerie) {
+    const seriesData = {
+      title: meta.title,
+      type: "series",
+      category: meta.genre || null,
+      genres: meta.genre || null,
+      cover_url: meta.cover_url || null,
+      backdrop_url: meta.backdrop_url || null,
+      description: meta.description || null,
+      year: meta.year ? Number(meta.year) : null,
+      director: meta.director || null,
+      cast_members: meta.cast || null,
+      language: meta.language || null,
+      rating: meta.rating ? Number(meta.rating) : null,
+      tmdb_id: meta.tmdb_id ? String(meta.tmdb_id) : null,
+      imdb_id: meta.imdb_id ? String(meta.imdb_id) : null,
+      trailer: meta.trailer || null,
+      is_new: true,
+    };
+
     // 1. Encontra ou cria o registro-pai em `contents`
     const existing = await supabaseGet(url, key, "contents", {
       title: `eq.${meta.title}`,
@@ -239,25 +258,10 @@ async function upsertToSupabase({ meta, r2Prefix, r2PublicBase, duration, has4k 
     let contentId;
     if (existing.length > 0) {
       contentId = existing[0].id;
-      console.log(`[Supabase] Série já existe (id=${contentId}), reutilizando.`);
+      await supabasePatch(url, key, "contents", { id: `eq.${contentId}` }, seriesData);
+      console.log(`[Supabase] Série já existe (id=${contentId}), metadados atualizados.`);
     } else {
-      const inserted = await supabasePost(url, key, "contents", {
-        title: meta.title,
-        type: "series",
-        category: meta.genre || null,
-        genres: meta.genre || null,
-        cover_url: meta.cover_url || null,
-        description: meta.description || null,
-        year: meta.year ? Number(meta.year) : null,
-        director: meta.director || null,
-        cast_members: meta.cast || null,
-        language: meta.language || null,
-        rating: meta.rating ? Number(meta.rating) : null,
-        tmdb_id: meta.tmdb_id ? String(meta.tmdb_id) : null,
-        imdb_id: meta.imdb_id ? String(meta.imdb_id) : null,
-        trailer: meta.trailer || null,
-        is_new: true,
-      });
+      const inserted = await supabasePost(url, key, "contents", seriesData);
       contentId = inserted.id;
       console.log(`[Supabase] Série criada (id=${contentId}).`);
     }
@@ -313,6 +317,7 @@ async function upsertToSupabase({ meta, r2Prefix, r2PublicBase, duration, has4k 
       content_url: contentUrl,
       r2_key: r2Key,
       cover_url: meta.cover_url || null,
+      backdrop_url: meta.backdrop_url || null,
       description: meta.description || null,
       year: meta.year ? Number(meta.year) : null,
       director: meta.director || null,

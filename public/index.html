@@ -159,6 +159,7 @@
       <input type="hidden" id="tmdb_id" />
       <input type="hidden" id="imdb_id" />
       <input type="hidden" id="cover_url" />
+      <input type="hidden" id="backdrop_url" />
       <input type="hidden" id="desc_val" />
       <input type="hidden" id="year_val" />
       <input type="hidden" id="director_val" />
@@ -475,6 +476,7 @@
         const desc     = d.overview || '';
         const rating   = d.vote_average ? d.vote_average.toFixed(1) : '';
         const poster   = d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : '';
+        const backdrop = d.backdrop_path ? `https://image.tmdb.org/t/p/original${d.backdrop_path}` : '';
         const language = d.original_language || '';
         const genres   = (d.genres || []).map(g => g.name).join(', ');
         const imdbId   = d.external_ids?.imdb_id || d.imdb_id || '';
@@ -498,6 +500,7 @@
         document.getElementById('tmdb_id').value    = String(id);
         document.getElementById('imdb_id').value    = imdbId;
         document.getElementById('cover_url').value  = poster;
+        document.getElementById('backdrop_url').value = backdrop;
         document.getElementById('desc_val').value   = desc;
         document.getElementById('year_val').value   = year;
         document.getElementById('director_val').value = director;
@@ -526,7 +529,7 @@
     }
 
     function clearTMDB() {
-      ['tmdb_id','imdb_id','cover_url','desc_val','year_val','director_val','cast_val','rating_val','trailer_val','genres_val','language_val']
+      ['tmdb_id','imdb_id','cover_url','backdrop_url','desc_val','year_val','director_val','cast_val','rating_val','trailer_val','genres_val','language_val']
         .forEach(id => document.getElementById(id).value = '');
       document.getElementById('tmdbPreview').style.display = 'none';
       document.getElementById('tmdbResults').classList.add('hidden');
@@ -562,6 +565,7 @@
         tmdb_id:     g('tmdb_id'),
         imdb_id:     g('imdb_id'),
         cover_url:   g('cover_url'),
+        backdrop_url: g('backdrop_url'),
         description: g('desc_val'),
         year:        g('year_val'),
         director:    g('director_val'),
