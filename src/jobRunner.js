@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
 import fs from "node:fs/promises";
 
-import { getGenericStream } from "./httpStream.js";
+import { getGenericStream, getLocalFileStream } from "./httpStream.js";
 import { probeAndReplayFromReadable } from "./probeStream.js";
 import { buildOutputRoot, ensureTree } from "./paths.js";
 import { normalizeM3u8InPlace } from "./playlists.js";
@@ -62,32 +62,128 @@ function nearFps(fps, target, tol = 0.2) {
    Supabase — escrita direta no banco
 ========================= */
 
+const SUPABASE_MAX_RETRIES = 4;
+const SUPABASE_TIMEOUT_MS = 15000;
+const RETRYABLE_FETCH_CODES = new Set([
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableStatus(status) {
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function getErrorCode(err) {
+  return err?.code || err?.cause?.code || "";
+}
+
+function isRetryableFetchError(err) {
+  if (!err) return false;
+  if (err?.name === "AbortError" || err?.name === "TimeoutError") return true;
+
+  const code = getErrorCode(err);
+  if (code && RETRYABLE_FETCH_CODES.has(code)) return true;
+
+  const message = String(err?.message || "").toLowerCase();
+  return message.includes("fetch failed") || message.includes("network");
+}
+
+function formatErrorChain(err) {
+  const parts = [];
+  let current = err;
+  while (current && parts.length < 5) {
+    const msg = current?.message ? String(current.message) : String(current);
+    const code = getErrorCode(current);
+    parts.push(code ? `${msg} [${code}]` : msg);
+    current = current?.cause;
+  }
+  return parts.join(" <- ");
+}
+
 function getSupabaseConfig() {
-  const url = String(process.env.SUPABASE_URL || "").trim();
+  const rawUrl = String(process.env.SUPABASE_URL || "").trim();
   const key = String(process.env.SUPABASE_SERVICE_KEY || "").trim();
-  if (!url) throw new Error("Missing env SUPABASE_URL");
+  if (!rawUrl) throw new Error("Missing env SUPABASE_URL");
   if (!key) throw new Error("Missing env SUPABASE_SERVICE_KEY");
+
+  const url = rawUrl.replace(/\/+$/, "");
+  try {
+    const parsed = new URL(url);
+    if (!parsed.protocol || !parsed.host) throw new Error("missing protocol or host");
+  } catch {
+    throw new Error(`SUPABASE_URL invalida: ${rawUrl}`);
+  }
+
   return { url, key };
 }
 
 function supabaseHeaders(key) {
   return {
     "Content-Type": "application/json",
-    "apikey": key,
-    "Authorization": `Bearer ${key}`,
-    "Prefer": "return=representation",
+    apikey: key,
+    Authorization: `Bearer ${key}`,
+    Prefer: "return=representation",
   };
 }
 
-async function supabaseGet(url, key, path, query) {
-  const qs = new URLSearchParams(query).toString();
-  const res = await fetch(`${url}/rest/v1/${path}?${qs}`, {
-    headers: supabaseHeaders(key),
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`Supabase GET ${path} falhou: HTTP ${res.status} | ${text}`);
+async function supabaseRequest(url, key, { method, path, query, data }) {
+  const qs = query ? new URLSearchParams(query).toString() : "";
+  const endpoint = `${url}/rest/v1/${path}${qs ? `?${qs}` : ""}`;
+
+  for (let attempt = 1; attempt <= SUPABASE_MAX_RETRIES; attempt++) {
+    try {
+      const init = {
+        method,
+        headers: supabaseHeaders(key),
+        signal: AbortSignal.timeout(SUPABASE_TIMEOUT_MS),
+      };
+      if (data !== undefined) init.body = JSON.stringify(data);
+
+      const res = await fetch(endpoint, init);
+      const text = await res.text();
+
+      if (res.ok) return text;
+
+      const httpErr = new Error(
+        `Supabase ${method} ${path} falhou: HTTP ${res.status} | ${text || "<empty>"}`
+      );
+      if (isRetryableStatus(res.status) && attempt < SUPABASE_MAX_RETRIES) {
+        const delay = 400 * Math.pow(2, attempt - 1);
+        console.warn(
+          `[Supabase] ${method} ${path} tentativa ${attempt}/${SUPABASE_MAX_RETRIES} falhou (HTTP ${res.status}). Retentando...`
+        );
+        await sleep(delay);
+        continue;
+      }
+      throw httpErr;
+    } catch (err) {
+      if (isRetryableFetchError(err) && attempt < SUPABASE_MAX_RETRIES) {
+        const delay = 400 * Math.pow(2, attempt - 1);
+        console.warn(
+          `[Supabase] ${method} ${path} tentativa ${attempt}/${SUPABASE_MAX_RETRIES} falhou (${formatErrorChain(err)}). Retentando...`
+        );
+        await sleep(delay);
+        continue;
+      }
+      throw err;
+    }
   }
+
+  throw new Error(`Supabase ${method} ${path} falhou apos ${SUPABASE_MAX_RETRIES} tentativas.`);
+}
+
+async function supabaseGet(url, key, path, query) {
+  const text = await supabaseRequest(url, key, { method: "GET", path, query });
   if (!text) return [];
   try {
     return JSON.parse(text);
@@ -97,25 +193,24 @@ async function supabaseGet(url, key, path, query) {
 }
 
 async function supabasePost(url, key, path, data) {
-  const res = await fetch(`${url}/rest/v1/${path}`, {
-    method: "POST",
-    headers: supabaseHeaders(key),
-    body: JSON.stringify(data),
-  });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Supabase POST ${path} falhou: HTTP ${res.status} | ${JSON.stringify(json)}`);
+  const text = await supabaseRequest(url, key, { method: "POST", path, data });
+  let json = {};
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    json = {};
+  }
   return Array.isArray(json) ? json[0] : json;
 }
 
 async function supabasePatch(url, key, path, query, data) {
-  const qs = new URLSearchParams(query).toString();
-  const res = await fetch(`${url}/rest/v1/${path}?${qs}`, {
-    method: "PATCH",
-    headers: supabaseHeaders(key),
-    body: JSON.stringify(data),
-  });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Supabase PATCH ${path} falhou: HTTP ${res.status} | ${JSON.stringify(json)}`);
+  const text = await supabaseRequest(url, key, { method: "PATCH", path, query, data });
+  let json = {};
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    json = {};
+  }
   return Array.isArray(json) ? json[0] : json;
 }
 
@@ -132,7 +227,6 @@ async function upsertToSupabase({ meta, r2Prefix, r2PublicBase, duration, has4k 
   const contentUrl = base ? `${base}/${r2Key}` : r2Key;
 
   const isSerie = meta.type === "serie" || meta.type === "series";
-  const dbType = isSerie ? "series" : "film";
 
   if (isSerie) {
     // 1. Encontra ou cria o registro-pai em `contents`
@@ -361,10 +455,14 @@ export async function runTranscodeJob({
   selectedSubs,
   externalSubs,
   videoFile = null,
+  localFilePath = null,
   hlsTime = 15,
   thumbsEvery = 10,
   onEvent,
 }) {
+  if (!url && !localFilePath) {
+    throw new Error("Nenhuma fonte informada (url ou arquivo local).");
+  }
   const outRoot = buildOutputRoot(baseRoot, meta);
   await ensureTree(outRoot, []);
   await mkdir(path.join(outRoot, "thumbs"), { recursive: true });
@@ -376,7 +474,9 @@ export async function runTranscodeJob({
   const uploadWatcher = startLiveUpload(outRoot, r2DestFolder);
 
   // Probe
-  const resProbe = await getGenericStream(url, { headers }, videoFile);
+  const resProbe = localFilePath
+    ? await getLocalFileStream(localFilePath)
+    : await getGenericStream(url, { headers }, videoFile);
   const { probe, replayStream } = await probeAndReplayFromReadable({
     inputReadable: resProbe,
     ffprobePath,
@@ -650,6 +750,7 @@ export async function runTranscodeJob({
   let replayUsed = false;
   const openInputStream = async () => {
     try {
+      if (localFilePath) return await getLocalFileStream(localFilePath);
       return await getGenericStream(url, { headers }, videoFile);
     } catch (e) {
       if (!replayUsed && replayStream) {
@@ -761,7 +862,7 @@ export async function runTranscodeJob({
       msg: `Banco atualizado: content_url="${dbRes.content_url}"`,
     });
   } catch (e) {
-    throw new Error(`Falha ao salvar no banco: ${e?.message || e}`);
+    throw new Error(`Falha ao salvar no banco: ${formatErrorChain(e)}`);
   }
 
   try {
