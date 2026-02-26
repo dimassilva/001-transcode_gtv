@@ -1,10 +1,20 @@
+import dotenv from "dotenv";
+import path from "node:path";
+import { existsSync } from "node:fs";
+
+// Carregar .env PRIMEIRO, antes de qualquer outra importação
+const envPath = existsSync(path.resolve(process.cwd(), ".dev.vars"))
+  ? path.resolve(process.cwd(), ".dev.vars")
+  : path.resolve(process.cwd(), ".env");
+dotenv.config({ path: envPath });
+
+// Agora importar tudo que depende de process.env
 import express from "express";
 import cors from "cors";
-import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { nanoid } from "nanoid";
-import multer from "multer"; // <--- NOVO
-import fs from "node:fs/promises"; // <--- NOVO (Para deletar o srt temp)
+import multer from "multer";
+import fs from "node:fs/promises";
 
 import { getGenericStream } from "./httpStream.js"; 
 import { probeAndReplayFromReadable } from "./probeStream.js";
@@ -36,6 +46,22 @@ function pushEvent(id, ev) {
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
+// --- LISTAR EPISÓDIOS/VÍDEOS NO TORRENT (para séries) ---
+app.post("/api/torrent/videos", async (req, res) => {
+  const { url } = req.body || {};
+  if (!url) return res.status(400).json({ error: "url obrigatório" });
+  if (!url.startsWith('magnet:')) return res.status(400).json({ error: "Apenas magnet links suportados" });
+  
+  try {
+    // Importa apenas aqui para não quebrar o resto
+    const { listTorrentVideoFiles } = await import("./httpStream.js");
+    const files = await listTorrentVideoFiles(url);
+    res.json({ success: true, files, count: files.length });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message) });
+  }
+});
+
 app.post("/api/probe-url", async (req, res) => {
   const { url } = req.body || {};
   if (!url) return res.status(400).json({ error: "url obrigatório" });
@@ -59,6 +85,9 @@ app.post("/api/jobs", upload.any(), async (req, res) => {
     const selectedAudios = JSON.parse(req.body.selectedAudios);
     // Legendas internas (do torrent)
     const selectedSubs = req.body.selectedSubs ? JSON.parse(req.body.selectedSubs) : [];
+    
+    // Para séries: arquivo de vídeo específico (opcional)
+    const videoFile = req.body.videoFile || null;
 
     // Processa Legendas EXTERNAS (Upload)
     const externalSubs = [];
@@ -102,6 +131,7 @@ app.post("/api/jobs", upload.any(), async (req, res) => {
           selectedAudios,
           selectedSubs,
           externalSubs, // <--- PASSANDO AS EXTERNAS
+          videoFile, // <--- PASSANDO O ARQUIVO SELECIONADO (para séries)
           r2DestFolder: r2Path,
           hlsTime: 15,
           thumbsEvery: 10,
@@ -133,6 +163,37 @@ app.get("/api/jobs/:id/events", (req, res) => {
   for (const ev of j.events) res.write(`data: ${JSON.stringify(ev)}\n\n`);
   j.listeners.push(res);
   req.on("close", () => { j.listeners = j.listeners.filter((x) => x !== res); });
+});
+
+// --- TMDB: Busca de filmes/séries ---
+app.get("/api/tmdb/search", async (req, res) => {
+  const { q, type } = req.query;
+  if (!q) return res.status(400).json({ error: "q obrigatório" });
+  const apiKey = process.env.TMDB_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: "TMDB_API_KEY não configurado" });
+  const mediaType = type === "serie" ? "tv" : "movie";
+  try {
+    const r = await fetch(`https://api.themoviedb.org/3/search/${mediaType}?api_key=${apiKey}&query=${encodeURIComponent(q)}&language=pt-BR&page=1`);
+    const data = await r.json();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- TMDB: Detalhes completos (créditos + vídeos + ids externos) ---
+app.get("/api/tmdb/details", async (req, res) => {
+  const { id, type } = req.query;
+  if (!id) return res.status(400).json({ error: "id obrigatório" });
+  const apiKey = process.env.TMDB_API_KEY;
+  const mediaType = type === "serie" ? "tv" : "movie";
+  try {
+    const r = await fetch(`https://api.themoviedb.org/3/${mediaType}/${id}?api_key=${apiKey}&language=pt-BR&append_to_response=credits,videos,external_ids`);
+    const data = await r.json();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.listen(5055, () => console.log("Server: http://localhost:5055"));

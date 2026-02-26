@@ -52,41 +52,196 @@ function ensurePrefix(p) {
   return s;
 }
 
+function nearFps(fps, target, tol = 0.2) {
+  const a = Number(fps);
+  const b = Number(target);
+  return Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) <= tol;
+}
+
 /* =========================
-   Supabase r2-ingest caller (NOVO)
+   Supabase — escrita direta no banco
 ========================= */
 
-async function callR2Ingest({ r2Prefix, r2PublicBase, has4k }) {
-  const url = String(process.env.SUPA_R2_INGEST_URL || "").trim();
-  const key = String(process.env.SUPA_INGEST_KEY || "").trim();
+function getSupabaseConfig() {
+  const url = String(process.env.SUPABASE_URL || "").trim();
+  const key = String(process.env.SUPABASE_SERVICE_KEY || "").trim();
+  if (!url) throw new Error("Missing env SUPABASE_URL");
+  if (!key) throw new Error("Missing env SUPABASE_SERVICE_KEY");
+  return { url, key };
+}
 
-  if (!url) throw new Error("Missing env SUPA_R2_INGEST_URL (URL da Edge Function r2-ingest).");
-  if (!key) throw new Error("Missing env SUPA_INGEST_KEY (x-ingest-key).");
-
-  const body = {
-    r2_prefix: ensurePrefix(r2Prefix),
-    r2_public_base: String(r2PublicBase || "").trim(),
-    has_4k: !!has4k,
+function supabaseHeaders(key) {
+  return {
+    "Content-Type": "application/json",
+    "apikey": key,
+    "Authorization": `Bearer ${key}`,
+    "Prefer": "return=representation",
   };
+}
 
-  if (!body.r2_prefix) throw new Error("callR2Ingest: r2_prefix vazio.");
-  if (!body.r2_public_base) throw new Error("callR2Ingest: r2_public_base vazio (R2_PUBLIC_BASE).");
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-ingest-key": key,
-    },
-    body: JSON.stringify(body),
+async function supabaseGet(url, key, path, query) {
+  const qs = new URLSearchParams(query).toString();
+  const res = await fetch(`${url}/rest/v1/${path}?${qs}`, {
+    headers: supabaseHeaders(key),
   });
-
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok || !json?.ok) {
-    throw new Error(`r2-ingest falhou: HTTP ${res.status} | ${JSON.stringify(json)}`);
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Supabase GET ${path} falhou: HTTP ${res.status} | ${text}`);
   }
+  if (!text) return [];
+  try {
+    return JSON.parse(text);
+  } catch {
+    return [];
+  }
+}
 
-  return json;
+async function supabasePost(url, key, path, data) {
+  const res = await fetch(`${url}/rest/v1/${path}`, {
+    method: "POST",
+    headers: supabaseHeaders(key),
+    body: JSON.stringify(data),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Supabase POST ${path} falhou: HTTP ${res.status} | ${JSON.stringify(json)}`);
+  return Array.isArray(json) ? json[0] : json;
+}
+
+async function supabasePatch(url, key, path, query, data) {
+  const qs = new URLSearchParams(query).toString();
+  const res = await fetch(`${url}/rest/v1/${path}?${qs}`, {
+    method: "PATCH",
+    headers: supabaseHeaders(key),
+    body: JSON.stringify(data),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Supabase PATCH ${path} falhou: HTTP ${res.status} | ${JSON.stringify(json)}`);
+  return Array.isArray(json) ? json[0] : json;
+}
+
+/**
+ * Insere ou atualiza o registro de filme/episódio no banco Supabase.
+ * - Para filmes (type='film'): insere/atualiza em `contents`.
+ * - Para séries (type='serie'/'series'): insere/atualiza em `contents` + `episodes`.
+ */
+async function upsertToSupabase({ meta, r2Prefix, r2PublicBase, duration, has4k }) {
+  const { url, key } = getSupabaseConfig();
+
+  const r2Key = `${r2Prefix}master.m3u8`;
+  const base = String(r2PublicBase || "").replace(/\/$/, "");
+  const contentUrl = base ? `${base}/${r2Key}` : r2Key;
+
+  const isSerie = meta.type === "serie" || meta.type === "series";
+  const dbType = isSerie ? "series" : "film";
+
+  if (isSerie) {
+    // 1. Encontra ou cria o registro-pai em `contents`
+    const existing = await supabaseGet(url, key, "contents", {
+      title: `eq.${meta.title}`,
+      type: `eq.series`,
+      select: "id",
+    });
+
+    let contentId;
+    if (existing.length > 0) {
+      contentId = existing[0].id;
+      console.log(`[Supabase] Série já existe (id=${contentId}), reutilizando.`);
+    } else {
+      const inserted = await supabasePost(url, key, "contents", {
+        title: meta.title,
+        type: "series",
+        category: meta.genre || null,
+        genres: meta.genre || null,
+        cover_url: meta.cover_url || null,
+        description: meta.description || null,
+        year: meta.year ? Number(meta.year) : null,
+        director: meta.director || null,
+        cast_members: meta.cast || null,
+        language: meta.language || null,
+        rating: meta.rating ? Number(meta.rating) : null,
+        tmdb_id: meta.tmdb_id ? String(meta.tmdb_id) : null,
+        imdb_id: meta.imdb_id ? String(meta.imdb_id) : null,
+        trailer: meta.trailer || null,
+        is_new: true,
+      });
+      contentId = inserted.id;
+      console.log(`[Supabase] Série criada (id=${contentId}).`);
+    }
+
+    // 2. Insere ou atualiza o episódio em `episodes`
+    const seasonNum = Number(meta.season || 1);
+    const episodeNum = Number(meta.episode || 1);
+
+    const existingEp = await supabaseGet(url, key, "episodes", {
+      content_id: `eq.${contentId}`,
+      season_number: `eq.${seasonNum}`,
+      number: `eq.${episodeNum}`,
+      select: "id",
+    });
+
+    const episodeData = {
+      content_id: contentId,
+      season_number: seasonNum,
+      number: episodeNum,
+      title: meta.episodeTitle || `Episódio ${episodeNum}`,
+      description: meta.episodeDescription || null,
+      duration: duration > 0 ? Math.round(duration) : null,
+      cover_url: meta.episodeCover || meta.cover_url || null,
+      content_url: contentUrl,
+      r2_key: r2Key,
+    };
+
+    let epResult;
+    if (existingEp.length > 0) {
+      epResult = await supabasePatch(url, key, "episodes", { id: `eq.${existingEp[0].id}` }, episodeData);
+      console.log(`[Supabase] Episódio S${seasonNum}E${episodeNum} atualizado.`);
+    } else {
+      epResult = await supabasePost(url, key, "episodes", episodeData);
+      console.log(`[Supabase] Episódio S${seasonNum}E${episodeNum} inserido.`);
+    }
+
+    return { contentId, episodeId: epResult?.id, r2_key: r2Key, content_url: contentUrl };
+
+  } else {
+    // Filme: insere ou atualiza em `contents`
+    const existing = await supabaseGet(url, key, "contents", {
+      title: `eq.${meta.title}`,
+      type: `eq.film`,
+      select: "id",
+    });
+
+    const filmData = {
+      title: meta.title,
+      type: "film",
+      category: meta.genre || null,
+      genres: meta.genre || null,
+      duration: duration > 0 ? Math.round(duration) : null,
+      content_url: contentUrl,
+      r2_key: r2Key,
+      cover_url: meta.cover_url || null,
+      description: meta.description || null,
+      year: meta.year ? Number(meta.year) : null,
+      director: meta.director || null,
+      cast_members: meta.cast || null,
+      language: meta.language || null,
+      rating: meta.rating ? Number(meta.rating) : null,
+      tmdb_id: meta.tmdb_id ? String(meta.tmdb_id) : null,
+      imdb_id: meta.imdb_id ? String(meta.imdb_id) : null,
+      trailer: meta.trailer || null,
+      is_new: true,
+    };
+
+    let result;
+    if (existing.length > 0) {
+      result = await supabasePatch(url, key, "contents", { id: `eq.${existing[0].id}` }, filmData);
+      console.log(`[Supabase] Filme "${meta.title}" atualizado (id=${existing[0].id}).`);
+    } else {
+      result = await supabasePost(url, key, "contents", filmData);
+      console.log(`[Supabase] Filme "${meta.title}" inserido (id=${result?.id}).`);
+    }
+
+    return { contentId: result?.id ?? existing[0]?.id, r2_key: r2Key, content_url: contentUrl };
+  }
 }
 
 /* =========================
@@ -94,9 +249,9 @@ async function callR2Ingest({ r2Prefix, r2PublicBase, has4k }) {
 ========================= */
 
 function bitrateForKey(key) {
-  if (key === "1080p") return "8000k";
-  if (key === "2160p") return "15000k";
-  return "8000k";
+  if (key === "1080p") return "16000k";
+  if (key === "2160p") return "22000k";
+  return "16000k";
 }
 
 function bitrateKbpsFromString(br) {
@@ -126,7 +281,9 @@ function buildFilterComplex(renditions, thumbsEvery, workFps) {
   const splitLabels = renditions.map((_, i) => `[v${i}]`).join("");
   const fpsFilter = workFps ? `,fps=${workFps}` : "";
 
-  const parts = [`[0:v]format=yuv420p,setpts=PTS-STARTPTS${fpsFilter},split=${splitCount + 1}${splitLabels}[vthumb]`];
+  const parts = [
+    `[0:v]format=yuv420p,setpts=PTS-STARTPTS${fpsFilter},split=${splitCount + 1}${splitLabels}[vthumb]`,
+  ];
 
   renditions.forEach((r, i) => {
     parts.push(`[v${i}]scale=${r.scaleW}:-2:flags=bilinear[vs${i}]`);
@@ -203,6 +360,7 @@ export async function runTranscodeJob({
   selectedAudios,
   selectedSubs,
   externalSubs,
+  videoFile = null,
   hlsTime = 15,
   thumbsEvery = 10,
   onEvent,
@@ -218,7 +376,7 @@ export async function runTranscodeJob({
   const uploadWatcher = startLiveUpload(outRoot, r2DestFolder);
 
   // Probe
-  const resProbe = await getGenericStream(url, { headers });
+  const resProbe = await getGenericStream(url, { headers }, videoFile);
   const { probe, replayStream } = await probeAndReplayFromReadable({
     inputReadable: resProbe,
     ffprobePath,
@@ -235,43 +393,52 @@ export async function runTranscodeJob({
   let rawDuration = probe.format?.duration || vStream?.duration || probe.streams?.[0]?.duration || 0;
   const duration = parseFloat(rawDuration);
 
+  // ✅ FPS:
+  // - mantém 60 quando tiver
+  // - normaliza 59.94 -> 60 (aplica fps=60 no filter)
+  // - se vier FPS absurdo (ex.: 120), capamos em 60 para não explodir GOP/segmentação
   const fpsIn = getVideoFpsFromProbe(probe);
-  const workFps = fpsIn > 31 ? 30 : null;
+  const isNear60 = nearFps(fpsIn, 59.94, 0.25) || nearFps(fpsIn, 60, 0.25);
+  const workFps = isNear60 ? 60 : fpsIn > 90 ? 60 : null;
 
   const { renditions, isReal4k } = selectRenditions1080AndMaybe4k({ srcW });
-
-  // ✅ define “has_4k” de forma inequívoca (baseado na saída gerada)
   const has4k = renditions.some((r) => r.key === "2160p") && isReal4k;
 
   onEvent?.({
     kind: "info",
-    msg: `Fonte: ${srcW}x${srcH} | 4K_real=${isReal4k ? "sim" : "não"} | Saídas: ${renditions.map((r) => r.key).join(" + ")}`,
+    msg: `Fonte: ${srcW}x${srcH} | fps_in=${Number.isFinite(fpsIn) ? fpsIn.toFixed(3) : fpsIn} | fps_work=${
+      workFps ?? "orig"
+    } | 4K_real=${isReal4k ? "sim" : "não"} | Saídas: ${renditions.map((r) => r.key).join(" + ")}`,
   });
 
   const filterComplex = buildFilterComplex(renditions, thumbsEvery, workFps);
 
   const fpsForGop = workFps || fpsIn;
-  const gop = clampInt(fpsForGop * hlsTime, 24, 600);
+
+  // ✅ GOP: suporta 60fps com hlsTime=15 => 900 frames; aumentamos max
+  const gop = clampInt(fpsForGop * hlsTime, 24, 2400);
   const forceExpr = `expr:gte(t,n_forced*${hlsTime})`;
 
   // Inputs
-  const args = ["-y"];
-  args.push("-i", "pipe:0");
+  const inputArgs = ["-y"];
+  // Ajuda MUITO quando a fonte tem PTS estranho/negativo
+  inputArgs.push("-fflags", "+genpts", "-avoid_negative_ts", "make_zero");
+  inputArgs.push("-i", "pipe:0");
 
   let inputIdx = 1;
   if (externalSubs) {
     for (const ext of externalSubs) {
       const absPath = path.resolve(ext.path);
       const encodingArgs = await getSubEncodingArgs(absPath);
-      args.push(...encodingArgs, "-i", absPath);
+      inputArgs.push(...encodingArgs, "-i", absPath);
       ext.inputIndex = inputIdx;
       inputIdx++;
     }
   }
 
-  args.push("-filter_complex", filterComplex);
+  inputArgs.push("-filter_complex", filterComplex);
 
-  // Vídeo
+  const videoOutputs = [];
   for (const [i, r] of renditions.entries()) {
     const outDir = path.join(outRoot, "video", r.key);
     await mkdir(outDir, { recursive: true });
@@ -280,49 +447,128 @@ export async function runTranscodeJob({
     const max = maxrateForBitrate(br, 1.5);
     const buf = bufsizeForMaxrate(max, 2);
 
-    args.push(
+    videoOutputs.push({ i, outDir, br, max, buf });
+  }
+
+  const getVideoEncoderArgs = (encoder) => {
+    if (encoder === "h264_amf") {
+      return [
+        "-c:v",
+        "h264_amf",
+        "-usage",
+        "transcoding",
+        "-quality",
+        "balanced",
+        "-profile:v",
+        "main",
+        "-rc",
+        "vbr_peak",
+        "-async_depth",
+        "2",
+        "-bf",
+        "0",
+        "-max_b_frames",
+        "0",
+      ];
+    }
+    if (encoder === "libx264") {
+      return [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-profile:v",
+        "main",
+        "-bf",
+        "0",
+        "-max_b_frames",
+        "0",
+      ];
+    }
+    return ["-c:v", encoder];
+  };
+
+  const buildVideoArgs = (encoder) => {
+    const encArgs = getVideoEncoderArgs(encoder);
+    const vArgs = [];
+    for (const v of videoOutputs) {
+      vArgs.push(
+        "-map",
+        `[vs${v.i}]`,
+        "-an",
+        "-sn",
+
+        ...encArgs,
+
+        "-b:v",
+        v.br,
+        "-maxrate",
+        v.max,
+        "-bufsize",
+        v.buf,
+
+        "-pix_fmt",
+        "yuv420p",
+
+        "-g",
+        String(gop),
+        "-keyint_min",
+        String(gop),
+        "-sc_threshold",
+        "0",
+        "-force_key_frames",
+        forceExpr,
+
+        "-max_muxing_queue_size",
+        "9999",
+
+        "-f",
+        "hls",
+        "-hls_time",
+        String(hlsTime),
+        "-hls_playlist_type",
+        "vod",
+        "-hls_flags",
+        "independent_segments",
+        "-hls_segment_type",
+        "fmp4",
+        "-hls_fmp4_init_filename",
+        path.join(v.outDir, "init.mp4"),
+        "-hls_segment_filename",
+        path.join(v.outDir, "chunk_%05d.m4s"),
+        path.join(v.outDir, "index.m3u8")
+      );
+    }
+    return vArgs;
+  };
+
+  // ?udio
+  const audioArgs = [];
+  for (const a of selectedAudios) {
+    const outDir = path.join(outRoot, `audio-${a.lang}`);
+    await mkdir(outDir, { recursive: true });
+
+    audioArgs.push(
       "-map",
-      `[vs${i}]`,
-      "-an",
+      `0:${a.aIndex}`,
+      "-vn",
       "-sn",
+      "-dn",
 
-      "-c:v",
-      "h264_amf",
-      "-usage",
-      "transcoding",
-      "-quality",
-      "balanced",
-      "-profile:v",
-      "main",
+      // ? CR?TICO: normaliza PTS do ?udio e corrige drift
+      // - asetpts=PTS-STARTPTS -> alinha o in?cio do ?udio em 0
+      // - aresample async -> corrige timestamp quebrado / drift ao longo do tempo
+      "-af",
+      "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS",
 
-      "-rc",
-      "vbr_peak",
-      "-async_depth",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      "-ac",
       "2",
-
-      "-bf",
-      "0",
-      "-max_b_frames",
-      "0",
-
-      "-b:v",
-      br,
-      "-maxrate",
-      max,
-      "-bufsize",
-      buf,
-
-      "-pix_fmt",
-      "yuv420p",
-
-      "-g",
-      String(gop),
-      "-keyint_min",
-      String(gop),
-      "-sc_threshold",
-      "0",
-      "-force_key_frames",
-      forceExpr,
+      "-ar",
+      "48000",
 
       "-max_muxing_queue_size",
       "9999",
@@ -345,49 +591,15 @@ export async function runTranscodeJob({
     );
   }
 
-  // Áudio
-  for (const a of selectedAudios) {
-    const outDir = path.join(outRoot, `audio-${a.lang}`);
-    await mkdir(outDir, { recursive: true });
-
-    args.push(
-      "-map",
-      `0:${a.aIndex}`,
-      "-vn",
-      "-sn",
-      "-dn",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "128k",
-      "-ac",
-      "2",
-      "-f",
-      "hls",
-      "-hls_time",
-      String(hlsTime),
-      "-hls_playlist_type",
-      "vod",
-      "-hls_flags",
-      "independent_segments",
-      "-hls_segment_type",
-      "fmp4",
-      "-hls_fmp4_init_filename",
-      path.join(outDir, "init.mp4"),
-      "-hls_segment_filename",
-      path.join(outDir, "chunk_%05d.m4s"),
-      path.join(outDir, "index.m3u8")
-    );
-  }
-
   const allSubsForMaster = [];
+  const subsArgs = [];
 
   // Legendas
   if (selectedSubs) {
     for (const s of selectedSubs) {
       const outDir = path.join(outRoot, "subs");
       const subName = `subs-${s.lang}-int`;
-      args.push(
+      subsArgs.push(
         "-map",
         `0:${s.sIndex}`,
         "-c:s",
@@ -412,7 +624,7 @@ export async function runTranscodeJob({
     for (const ext of externalSubs) {
       const outDir = path.join(outRoot, "subs");
       const subName = `subs-${ext.lang}-ext`;
-      args.push(
+      subsArgs.push(
         "-map",
         `${ext.inputIndex}:0`,
         "-c:s",
@@ -433,36 +645,86 @@ export async function runTranscodeJob({
     }
   }
 
-  // Thumbs
-  args.push("-map", "[thumbs]", "-q:v", "3", path.join(outRoot, "thumbs", "thumb_%05d.jpg"));
+  const thumbsArgs = ["-map", "[thumbs]", "-q:v", "3", path.join(outRoot, "thumbs", "thumb_%05d.jpg")];
 
-  console.log("[Job] Iniciando conversão (modo estabilidade AMF)...");
-  console.log(`[Debug] FFmpeg: ${ffmpegPath} ${args.join(" ")}`);
+  let replayUsed = false;
+  const openInputStream = async () => {
+    try {
+      return await getGenericStream(url, { headers }, videoFile);
+    } catch (e) {
+      if (!replayUsed && replayStream) {
+        replayUsed = true;
+        return replayStream;
+      }
+      throw e;
+    }
+  };
 
-  let inputStream = null;
-  try {
-    inputStream = await getGenericStream(url, { headers });
-  } catch {
-    inputStream = replayStream;
+  const runFfmpegOnce = async ({ args, label }) => {
+    console.log(`[Job] Iniciando conversao (${label})...`);
+    console.log(`[Debug] FFmpeg: ${ffmpegPath} ${args.join(" ")}`);
+
+    let inputStream = null;
+    try {
+      inputStream = await openInputStream();
+    } catch (e) {
+      console.log(`[Stream Input Error] ${e.message}`);
+      return { exitCode: -1, error: e };
+    }
+
+    const ff = spawn(ffmpegPath, args, { windowsHide: true });
+    let stderrText = "";
+
+    ff.stdin.on("error", () => {});
+    ff.stderr.on("data", (chunk) => {
+      const msg = chunk.toString();
+      stderrText += msg;
+      if (msg.toLowerCase().includes("error") || msg.includes("Invalid")) console.log(`[FFmpeg] ${msg}`);
+      if (msg.includes("speed=")) onEvent?.({ kind: "log", step: "ffmpeg", line: msg });
+    });
+
+    inputStream.pipe(ff.stdin);
+    inputStream.on("error", (e) => console.log(`[Stream Input Error] ${e.message}`));
+
+    const result = await new Promise((res) => {
+      let settled = false;
+      ff.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        res({ code: null, error: err });
+      });
+      ff.on("close", (code) => {
+        if (settled) return;
+        settled = true;
+        res({ code, error: null });
+      });
+    });
+
+    try {
+      inputStream.destroy();
+    } catch {}
+
+    if (result.error) {
+      console.log(`[FFmpeg] ${result.error.message}`);
+      return { exitCode: -1, error: result.error, stderrText };
+    }
+
+    const normalized = typeof result.code === "number" ? normalizeExitCode(result.code) : -1;
+    return { exitCode: normalized, error: null, stderrText };
+  };
+
+  const amfArgs = [...inputArgs, ...buildVideoArgs("h264_amf"), ...audioArgs, ...subsArgs, ...thumbsArgs];
+  const x264Args = [...inputArgs, ...buildVideoArgs("libx264"), ...audioArgs, ...subsArgs, ...thumbsArgs];
+
+  const amfResult = await runFfmpegOnce({ args: amfArgs, label: "AMF" });
+  if (amfResult.exitCode !== 0) {
+    console.log("[Job] AMF falhou. Tentando fallback libx264...");
+    onEvent?.({ kind: "info", msg: "AMF falhou. Tentando fallback libx264." });
+    const x264Result = await runFfmpegOnce({ args: x264Args, label: "libx264" });
+    if (x264Result.exitCode !== 0) {
+      throw new Error(`FFmpeg falhou (AMF code=${amfResult.exitCode}, libx264 code=${x264Result.exitCode})`);
+    }
   }
-
-  const ff = spawn(ffmpegPath, args, { windowsHide: true });
-
-  ff.stdin.on("error", () => {});
-  ff.stderr.on("data", (chunk) => {
-    const msg = chunk.toString();
-    if (msg.toLowerCase().includes("error") || msg.includes("Invalid")) console.log(`[FFmpeg] ${msg}`);
-    if (msg.includes("speed=")) onEvent?.({ kind: "log", step: "ffmpeg", line: msg });
-  });
-
-  inputStream.pipe(ff.stdin);
-  inputStream.on("error", (e) => console.log(`[Stream Input Error] ${e.message}`));
-
-  const exitCode = await new Promise((res, rej) => {
-    ff.on("error", rej);
-    ff.on("close", res);
-  });
-  if (normalizeExitCode(exitCode) !== 0) throw new Error(`FFmpeg falhou code=${exitCode}`);
 
   if (duration > 0) await generateThumbsVTT(outRoot, duration, thumbsEvery);
 
@@ -473,31 +735,33 @@ export async function runTranscodeJob({
   writeMaster(outRoot, renditions, selectedAudios, allSubsForMaster, "master.m3u8", null);
   writeMaster(outRoot, renditions, selectedAudios, allSubsForMaster, "master-hd.m3u8", 1080);
 
-  console.log("[Job] Upload Final (re-upload completo)...");
+  // ✅ Fecha o upload ao vivo antes do upload final (evita arquivo parcial no R2)
+  console.log("[Job] Encerrando upload ao vivo...");
   await uploadWatcher.close();
+
+  // ✅ (REMOVIDO) preview.mp4 — não gera mais preview
+
+  console.log("[Job] Upload Final (re-upload completo)...");
   await uploadDirectoryRecursive(outRoot, r2DestFolder);
 
-  // ✅ AGORA: avisa o Supabase que o pacote existe no R2
-  // (faz depois do upload final para garantir que master/master-hd já estão no R2)
+  // ✅ Salva/atualiza o registro no banco Supabase
   try {
     const r2PublicBase = String(process.env.R2_PUBLIC_BASE || "").trim();
     const r2Prefix = ensurePrefix(r2DestFolder);
 
     onEvent?.({
       kind: "info",
-      msg: `Chamando r2-ingest: prefix="${r2Prefix}" has_4k=${has4k ? "true" : "false"}`,
+      msg: `Salvando no banco: prefix="${r2Prefix}" has_4k=${has4k ? "true" : "false"}`,
     });
 
-    const ingestRes = await callR2Ingest({ r2Prefix, r2PublicBase, has4k });
+    const dbRes = await upsertToSupabase({ meta, r2Prefix, r2PublicBase, duration, has4k });
 
     onEvent?.({
       kind: "info",
-      msg: `r2-ingest OK: ${JSON.stringify(ingestRes?.hls || ingestRes)}`,
+      msg: `Banco atualizado: content_url="${dbRes.content_url}"`,
     });
   } catch (e) {
-    // Se você preferir NÃO falhar o job por causa do ingest, troque por "console.warn" e siga.
-    // Eu deixei falhar, porque sem isso o catálogo não atualiza.
-    throw new Error(`Falha ao chamar r2-ingest: ${e?.message || e}`);
+    throw new Error(`Falha ao salvar no banco: ${e?.message || e}`);
   }
 
   try {

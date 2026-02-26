@@ -31,7 +31,7 @@ function getInfoHash(magnetLink) {
 }
 
 // --- Helper para extrair o arquivo e resolver o stream ---
-function getVideoFileStream(torrent, resolve, reject) {
+function getVideoFileStream(torrent, resolve, reject, videoFileName = null) {
     // Função auxiliar para processar quando estiver pronto
     const onReady = () => {
         if (!torrent.files || torrent.files.length === 0) {
@@ -39,10 +39,20 @@ function getVideoFileStream(torrent, resolve, reject) {
             return;
         }
 
-        const file = torrent.files.find(f => /\.(mp4|mkv|avi|mov|webm)$/i.test(f.name));
+        const videoFiles = torrent.files.filter(f => /\.(mp4|mkv|avi|mov|webm)$/i.test(f.name));
+        
+        if (videoFiles.length === 0) {
+            reject(new Error("Nenhum arquivo de vídeo encontrado no Torrent."));
+            return;
+        }
+
+        // Se especificou um arquivo, usa ele. Senão, usa o primeiro.
+        const file = videoFileName 
+            ? videoFiles.find(f => f.name === videoFileName) || videoFiles[0]
+            : videoFiles[0];
 
         if (!file) {
-            reject(new Error("Nenhum arquivo de vídeo encontrado no Torrent."));
+            reject(new Error(`Arquivo ${videoFileName} não encontrado no Torrent.`));
             return;
         }
 
@@ -74,46 +84,6 @@ function getVideoFileStream(torrent, resolve, reject) {
     } else {
         torrent.once('metadata', onReady);
     }
-}
-
-// --- Lógica Magnet ---
-async function openMagnetStream(magnetLink) {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error("Timeout: Não foi possível encontrar peers ou metadados."));
-    }, 60000); 
-
-    const infoHash = getInfoHash(magnetLink);
-    
-    console.log('[Torrent] Tentando iniciar torrent...');
-
-    // ESTRATÉGIA "TRY-ADD": Tenta adicionar. Se falhar por duplicidade, recupera o existente.
-    try {
-        torrentClient.add(magnetLink, { path: './temp_torrent_cache' }, (torrent) => {
-            clearTimeout(timeout);
-            getVideoFileStream(torrent, resolve, reject);
-        });
-    } catch (err) {
-        // Se o erro for "Duplicate torrent", significa que já está na memória. Vamos usar!
-        if (err.message.includes('duplicate') || err.message.includes('Torrent with same infoHash')) {
-            console.log(`[Torrent] Detectado torrent já ativo: ${infoHash}. Reutilizando...`);
-            
-            const existing = torrentClient.get(infoHash);
-            if (existing) {
-                clearTimeout(timeout);
-                getVideoFileStream(existing, resolve, reject);
-            } else {
-                // Caso raríssimo: Deu erro de duplicado mas o get retornou null.
-                clearTimeout(timeout);
-                reject(new Error("Erro crítico: Torrent duplicado fantasma. Reinicie o servidor."));
-            }
-        } else {
-            // Outro erro qualquer
-            clearTimeout(timeout);
-            reject(err);
-        }
-    }
-  });
 }
 
 // --- Lógica HTTP ---
@@ -154,12 +124,120 @@ async function openHttpStream(url, { headers = {}, timeoutMs = 20000, maxRedirec
   throw new Error("Max Redirects");
 }
 
-export async function getGenericStream(inputUrl, options = {}) {
+export async function getGenericStream(inputUrl, options = {}, videoFileName = null) {
     if (inputUrl.startsWith('magnet:')) {
-        return openMagnetStream(inputUrl);
+        return openMagnetStreamWithFile(inputUrl, videoFileName);
     } else if (inputUrl.startsWith('http')) {
         return openHttpStream(inputUrl, options);
     } else {
         throw new Error("Protocolo não suportado (apenas http, https ou magnet)");
     }
+}
+
+// Função para listar arquivos de vídeo no torrent (para seleção em séries)
+export async function listTorrentVideoFiles(magnetLink) {
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            reject(new Error("Timeout: Não foi possível listar arquivos do torrent."));
+        }, 60000);
+
+        const infoHash = getInfoHash(magnetLink);
+
+        try {
+            torrentClient.add(magnetLink, { path: './temp_torrent_cache' }, (torrent) => {
+                const onReady = () => {
+                    if (!torrent.files || torrent.files.length === 0) {
+                        clearTimeout(timeout);
+                        reject(new Error("Torrent carregou mas não tem arquivos."));
+                        return;
+                    }
+
+                    // Filtra apenas arquivos de vídeo
+                    const videoFiles = torrent.files
+                        .filter(f => /\.(mp4|mkv|avi|mov|webm)$/i.test(f.name))
+                        .map(f => ({
+                            name: f.name,
+                            size: f.length,
+                            sizeMB: (f.length / 1024 / 1024).toFixed(2)
+                        }));
+
+                    if (videoFiles.length === 0) {
+                        clearTimeout(timeout);
+                        reject(new Error("Nenhum arquivo de vídeo encontrado."));
+                        return;
+                    }
+
+                    clearTimeout(timeout);
+                    resolve(videoFiles);
+                };
+
+                if (torrent.files && torrent.files.length > 0) {
+                    onReady();
+                } else {
+                    torrent.once('metadata', onReady);
+                }
+            });
+        } catch (err) {
+            if (err.message.includes('duplicate') || err.message.includes('Torrent with same infoHash')) {
+                const existing = torrentClient.get(infoHash);
+                if (existing) {
+                    const videoFiles = existing.files
+                        .filter(f => /\.(mp4|mkv|avi|mov|webm)$/i.test(f.name))
+                        .map(f => ({
+                            name: f.name,
+                            size: f.length,
+                            sizeMB: (f.length / 1024 / 1024).toFixed(2)
+                        }));
+                    clearTimeout(timeout);
+                    if (videoFiles.length === 0) {
+                        reject(new Error("Nenhum arquivo de vídeo encontrado."));
+                    } else {
+                        resolve(videoFiles);
+                    }
+                } else {
+                    clearTimeout(timeout);
+                    reject(new Error("Erro: Torrent não encontrado."));
+                }
+            } else {
+                clearTimeout(timeout);
+                reject(err);
+            }
+        }
+    });
+}
+
+// Versão melhorada de openMagnetStream que aceita videoFileName
+async function openMagnetStreamWithFile(magnetLink, videoFileName = null) {
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            reject(new Error("Timeout: Não foi possível encontrar peers ou metadados."));
+        }, 60000); 
+
+        const infoHash = getInfoHash(magnetLink);
+        
+        console.log('[Torrent] Tentando iniciar torrent...');
+
+        try {
+            torrentClient.add(magnetLink, { path: './temp_torrent_cache' }, (torrent) => {
+                clearTimeout(timeout);
+                getVideoFileStream(torrent, resolve, reject, videoFileName);
+            });
+        } catch (err) {
+            if (err.message.includes('duplicate') || err.message.includes('Torrent with same infoHash')) {
+                console.log(`[Torrent] Detectado torrent já ativo: ${infoHash}. Reutilizando...`);
+                
+                const existing = torrentClient.get(infoHash);
+                if (existing) {
+                    clearTimeout(timeout);
+                    getVideoFileStream(existing, resolve, reject, videoFileName);
+                } else {
+                    clearTimeout(timeout);
+                    reject(new Error("Erro crítico: Torrent duplicado fantasma. Reinicie o servidor."));
+                }
+            } else {
+                clearTimeout(timeout);
+                reject(err);
+            }
+        }
+    });
 }

@@ -2,10 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 function fallbackBitrateKbpsByKey(key) {
-  // ✅ alinhado com seu jobrunner atual (1080=8000k, 4K=15000k)
-  if (key === "1080p") return 8000;
-  if (key === "2160p") return 15000;
-  return 8000;
+  // ✅ alinhado com seu jobrunner atual (1080=16000k, 4K=22000k)
+  if (key === "1080p") return 16000;
+  if (key === "2160p") return 22000;
+  return 16000;
 }
 
 // H.264 Main + AAC-LC (descrição genérica e compatível)

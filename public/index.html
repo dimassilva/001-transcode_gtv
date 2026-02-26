@@ -95,23 +95,59 @@
         <span class="text-xs text-white/50">Meta + trilhas</span>
       </div>
 
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
-        <div>
-          <label class="block text-xs text-white/60 mb-2">Título Oficial</label>
-          <input type="text" id="title" class="w-full p-3 rounded-xl bg-black/40 soft-border soft-ring" />
+      <!-- Título + Busca TMDB -->
+      <div class="mb-4">
+        <label class="block text-xs text-white/60 mb-2">Título Oficial</label>
+        <div class="flex gap-2">
+          <input type="text" id="title" placeholder="Ex: The Dark Knight"
+            class="flex-1 p-3 rounded-xl bg-black/40 soft-border soft-ring text-white placeholder:text-white/30" />
+          <button onclick="searchTMDB()" id="btnTmdb"
+            class="whitespace-nowrap px-4 py-3 rounded-xl bg-purple-600 hover:bg-purple-700 text-white text-sm font-semibold border border-purple-500/40 transition">
+            🔍 Buscar no TMDB
+          </button>
         </div>
+      </div>
 
-        <div>
-          <label class="block text-xs text-white/60 mb-2">Gênero</label>
-          <select id="genre" class="w-full p-3 rounded-xl bg-black/40 soft-border soft-ring">
-            <option>Ação</option><option>Aventura</option><option>Animacao</option><option>Anime</option><option>Brasileiros</option>
-            <option>Clássicos</option><option>Comédia stand-up</option><option>Comédias</option><option>Curtas</option>
-            <option>Documentários</option><option>Drama</option><option>Esportes</option><option>Estrangeiros</option>
-            <option>Fantasia</option><option>Fé e espiritualidade</option><option>Ficção cientifica</option>
-            <option>Hollywood</option><option>Independentes</option><option>Música e musicais</option>
-            <option>Policial</option><option>Romance</option><option>Suspense</option><option>Terror</option>
-          </select>
+      <!-- Resultados TMDB -->
+      <div id="tmdbResults" class="hidden mb-4 p-3 rounded-2xl bg-black/40 border border-white/10 max-h-72 overflow-y-auto space-y-1"></div>
+
+      <!-- Preview selecionado -->
+      <div id="tmdbPreview" class="hidden mb-4 gap-4 p-4 rounded-2xl bg-purple-900/20 border border-purple-500/30" style="display:none">
+        <div class="flex gap-4">
+          <img id="tmdbPoster" src="" alt="Capa" class="h-28 w-auto rounded-xl object-cover shrink-0" />
+          <div class="min-w-0 flex-1">
+            <div id="tmdbPreviewTitle" class="text-white font-semibold text-sm"></div>
+            <div id="tmdbPreviewMeta" class="text-white/50 text-xs mt-0.5"></div>
+            <div id="tmdbPreviewDesc" class="text-white/60 text-xs mt-2 overflow-hidden" style="display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical"></div>
+            <button onclick="clearTMDB()" class="mt-2 text-xs text-red-400 hover:text-red-300 transition">✕ Limpar seleção</button>
+          </div>
         </div>
+      </div>
+
+      <!-- Campos ocultos com dados do TMDB -->
+      <input type="hidden" id="tmdb_id" />
+      <input type="hidden" id="imdb_id" />
+      <input type="hidden" id="cover_url" />
+      <input type="hidden" id="desc_val" />
+      <input type="hidden" id="year_val" />
+      <input type="hidden" id="director_val" />
+      <input type="hidden" id="cast_val" />
+      <input type="hidden" id="rating_val" />
+      <input type="hidden" id="trailer_val" />
+      <input type="hidden" id="genres_val" />
+      <input type="hidden" id="language_val" />
+
+      <!-- Gênero (categoria no app) -->
+      <div class="mb-4">
+        <label class="block text-xs text-white/60 mb-2">Gênero (categoria no app)</label>
+        <select id="genre" class="w-full p-3 rounded-xl bg-black/40 soft-border soft-ring text-white">
+          <option>Ação</option><option>Aventura</option><option>Animacao</option><option>Anime</option><option>Brasileiros</option>
+          <option>Clássicos</option><option>Comédia stand-up</option><option>Comédias</option><option>Curtas</option>
+          <option>Documentários</option><option>Drama</option><option>Esportes</option><option>Estrangeiros</option>
+          <option>Fantasia</option><option>Fé e espiritualidade</option><option>Ficção cientifica</option>
+          <option>Hollywood</option><option>Independentes</option><option>Música e musicais</option>
+          <option>Policial</option><option>Romance</option><option>Suspense</option><option>Terror</option>
+        </select>
       </div>
 
       <div class="mb-4">
@@ -137,6 +173,20 @@
           <label class="block text-xs text-white/60 mb-2">Episódio</label>
           <input type="number" id="episode" value="1" class="w-full p-3 rounded-xl bg-black/40 soft-border soft-ring">
         </div>
+      </div>
+
+      <!-- Seleção de Vídeo (para séries com múltiplos episódios) -->
+      <div id="videoSelectSection" class="hidden mb-4 p-4 rounded-2xl bg-blue-900/20 border border-blue-500/30">
+        <div class="flex items-center justify-between gap-3 mb-3">
+          <h3 class="text-sm font-semibold text-white/90">📺 Escolha o Episódio</h3>
+          <button onclick="loadTorrentVideos()" class="text-xs px-3 py-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition">
+            🔄 Recarregar Lista
+          </button>
+        </div>
+        <div id="videoList" class="space-y-2 max-h-48 overflow-y-auto pr-1">
+          <div class="text-white/40 italic text-sm p-2">Carregando vídeos...</div>
+        </div>
+        <input type="hidden" id="selectedVideo" />
       </div>
 
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-6 mt-6">
@@ -212,6 +262,57 @@
   <script>
     function toggleSeries(isSeries) {
       document.getElementById('seriesFields').classList.toggle('hidden', !isSeries);
+      document.getElementById('videoSelectSection').classList.toggle('hidden', !isSeries);
+      if (isSeries) {
+        // Auto-carregar lista de vídeos quando switch para série
+        setTimeout(() => loadTorrentVideos(), 100);
+      }
+    }
+
+    async function loadTorrentVideos() {
+      const url = document.getElementById('magnetUrl').value;
+      if (!url) return alert("Digite a magnet link primeiro!");
+      
+      const videoList = document.getElementById('videoList');
+      videoList.innerHTML = '<div class="text-white/40 italic text-sm p-2">Carregando vídeos do torrent...</div>';
+      
+      try {
+        const res = await fetch('/api/torrent/videos', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ url })
+        });
+        const data = await res.json();
+        
+        if (!data.success || !data.files || data.files.length === 0) {
+          videoList.innerHTML = '<div class="text-red-400 text-sm p-2">❌ Nenhum vídeo encontrado no torrent</div>';
+          return;
+        }
+        
+        videoList.innerHTML = data.files.map((f, idx) => `
+          <label class="flex items-center gap-3 p-2 rounded-xl cursor-pointer rounded-xl px-3 py-2 bg-white/5 border border-white/10 hover:bg-white/10 transition">
+            <input type="radio" name="videoFile" value="${f.name}" onchange="selectVideo('${f.name}')" ${idx === 0 ? 'checked' : ''}>
+            <span class="text-sm text-white/80">
+              <div class="font-medium">${f.name}</div>
+              <div class="text-white/50 text-xs">${f.sizeMB} MB</div>
+            </span>
+          </label>
+        `).join('');
+        
+        // Seleciona o primeiro por padrão
+        if (data.files.length > 0) {
+          selectVideo(data.files[0].name);
+        }
+        
+        document.getElementById('logContent').innerHTML += `<br>✅ ${data.count} vídeo(s) encontrado(s) no torrent`;
+      } catch (e) {
+        videoList.innerHTML = `<div class="text-red-400 text-sm p-2">❌ Erro: ${e.message}</div>`;
+      }
+    }
+
+    function selectVideo(fileName) {
+      document.getElementById('selectedVideo').value = fileName;
+      document.getElementById('logContent').innerHTML += `<br>📺 Vídeo selecionado: <b>${fileName}</b>`;
     }
 
     async function checkLink() {
@@ -219,7 +320,6 @@
       if(!url) return alert("Link vazio!");
       document.getElementById('logArea').classList.remove('hidden');
       document.getElementById('logContent').innerHTML = "Verificando link... (Aguarde o Probe)";
-
       try {
         const res = await fetch('/api/probe-url', {
           method: 'POST',
@@ -227,11 +327,16 @@
           body: JSON.stringify({ url })
         });
         const data = await res.json();
-
         if(data.probe) {
           renderTracks(data.probe.streams);
           document.getElementById('metaSection').classList.remove('hidden');
-          document.getElementById('logContent').innerHTML += "<br>Link verificado! Preencha os dados.";
+          document.getElementById('logContent').innerHTML += "<br>Link verificado! Preencha os dados e busque no TMDB.";
+          
+          // Se for série, carrega lista de vídeos
+          const isSeries = document.querySelector('input[name="type"]:checked').value === 'serie';
+          if (isSeries) {
+            setTimeout(() => loadTorrentVideos(), 500);
+          }
         } else {
           alert("Erro ao ler torrent: " + (data.error || 'Desconhecido'));
         }
@@ -243,42 +348,168 @@
     function renderTracks(streams) {
       const al = document.getElementById('audioList'); al.innerHTML = '';
       const sl = document.getElementById('subList'); sl.innerHTML = '';
-
       streams.forEach((s) => {
         if(s.codec_type === 'audio') {
           const lang = s.tags?.language || 'und';
           const title = s.tags?.title || `Stream #${s.index}`;
-          al.innerHTML += `
-            <label class="flex items-center gap-2 cursor-pointer rounded-xl px-3 py-2 bg-white/5 border border-white/10 hover:bg-white/10 transition">
-              <input type="checkbox" name="selAudio" value="${s.index}" data-lang="${lang}" data-name="${title}">
-              <span class="text-sm text-white/80">${lang.toUpperCase()} - ${title}</span>
-            </label>`;
+          al.innerHTML += `<label class="flex items-center gap-2 cursor-pointer rounded-xl px-3 py-2 bg-white/5 border border-white/10 hover:bg-white/10 transition"><input type="checkbox" name="selAudio" value="${s.index}" data-lang="${lang}" data-name="${title}"><span class="text-sm text-white/80">${lang.toUpperCase()} - ${title}</span></label>`;
         }
         if(s.codec_type === 'subtitle') {
           const lang = s.tags?.language || 'und';
           const title = s.tags?.title || `Stream #${s.index}`;
-          sl.innerHTML += `
-            <label class="flex items-center gap-2 cursor-pointer rounded-xl px-3 py-2 bg-white/5 border border-white/10 hover:bg-white/10 transition">
-              <input type="checkbox" name="selSub" value="${s.index}" data-lang="${lang}" data-name="${title}">
-              <span class="text-sm text-white/80">${lang.toUpperCase()} - ${title}</span>
-            </label>`;
+          sl.innerHTML += `<label class="flex items-center gap-2 cursor-pointer rounded-xl px-3 py-2 bg-white/5 border border-white/10 hover:bg-white/10 transition"><input type="checkbox" name="selSub" value="${s.index}" data-lang="${lang}" data-name="${title}"><span class="text-sm text-white/80">${lang.toUpperCase()} - ${title}</span></label>`;
         }
       });
-
       if(sl.innerHTML === '') sl.innerHTML = '<div class="text-white/40 italic">Nenhuma legenda interna encontrada.</div>';
     }
 
+    // ========================
+    // TMDB
+    // ========================
+    async function searchTMDB() {
+      const title = document.getElementById('title').value.trim();
+      const type = document.querySelector('input[name="type"]:checked').value;
+      if (!title) return alert("Digite um título para buscar!");
+      const btn = document.getElementById('btnTmdb');
+      btn.textContent = 'Buscando...';
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/tmdb/search?q=${encodeURIComponent(title)}&type=${type}`);
+        const data = await res.json();
+        renderTMDBResults(data.results || [], type);
+      } catch (e) {
+        alert("Erro ao buscar no TMDB: " + e.message);
+      } finally {
+        btn.textContent = '🔍 Buscar no TMDB';
+        btn.disabled = false;
+      }
+    }
+
+    function renderTMDBResults(results, type) {
+      const container = document.getElementById('tmdbResults');
+      if (!results.length) {
+        container.innerHTML = '<div class="text-white/40 text-sm italic p-2">Nenhum resultado encontrado.</div>';
+        container.classList.remove('hidden');
+        return;
+      }
+      container.innerHTML = results.slice(0, 8).map(r => {
+        const title = (r.title || r.name || '').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        const year = (r.release_date || r.first_air_date || '').slice(0, 4);
+        const poster = r.poster_path ? `https://image.tmdb.org/t/p/w92${r.poster_path}` : '';
+        const rating = r.vote_average ? ` · ⭐ ${r.vote_average.toFixed(1)}` : '';
+        const overview = (r.overview || '').substring(0, 100);
+        return `<div onclick="selectTMDB(${r.id}, '${type}')" class="flex items-center gap-3 p-2 rounded-xl cursor-pointer hover:bg-white/10 border border-transparent hover:border-white/10 transition">${poster ? `<img src="${poster}" class="h-16 w-11 rounded object-cover shrink-0"/>` : `<div class="h-16 w-11 rounded bg-white/10 shrink-0"></div>`}<div class="min-w-0"><div class="text-white text-sm font-medium truncate">${title}</div><div class="text-white/40 text-xs">${year}${rating}</div><div class="text-white/30 text-xs truncate">${overview}</div></div></div>`;
+      }).join('');
+      container.classList.remove('hidden');
+    }
+
+    async function selectTMDB(id, type) {
+      document.getElementById('tmdbResults').classList.add('hidden');
+      const btn = document.getElementById('btnTmdb');
+      btn.textContent = 'Carregando...';
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/tmdb/details?id=${id}&type=${type}`);
+        const d = await res.json();
+        const isTv = type === 'serie';
+
+        const title    = d.title || d.name || '';
+        const year     = (d.release_date || d.first_air_date || '').slice(0, 4);
+        const desc     = d.overview || '';
+        const rating   = d.vote_average ? d.vote_average.toFixed(1) : '';
+        const poster   = d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : '';
+        const language = d.original_language || '';
+        const genres   = (d.genres || []).map(g => g.name).join(', ');
+        const imdbId   = d.external_ids?.imdb_id || d.imdb_id || '';
+
+        let director = '';
+        if (isTv) {
+          director = (d.created_by || []).map(p => p.name).join(', ');
+        } else {
+          const dir = (d.credits?.crew || []).find(c => c.job === 'Director');
+          director = dir ? dir.name : '';
+        }
+
+        const cast = (d.credits?.cast || []).slice(0, 5).map(c => c.name).join(', ');
+        const trailerObj = (d.videos?.results || []).find(v => v.site === 'YouTube' && v.type === 'Trailer');
+        const trailerUrl = trailerObj ? `https://www.youtube.com/watch?v=${trailerObj.key}` : '';
+
+        // Preenche título visível
+        document.getElementById('title').value = title;
+
+        // Preenche campos ocultos
+        document.getElementById('tmdb_id').value    = String(id);
+        document.getElementById('imdb_id').value    = imdbId;
+        document.getElementById('cover_url').value  = poster;
+        document.getElementById('desc_val').value   = desc;
+        document.getElementById('year_val').value   = year;
+        document.getElementById('director_val').value = director;
+        document.getElementById('cast_val').value   = cast;
+        document.getElementById('rating_val').value = rating;
+        document.getElementById('trailer_val').value = trailerUrl;
+        document.getElementById('genres_val').value = genres;
+        document.getElementById('language_val').value = language;
+
+        // Preview
+        const preview = document.getElementById('tmdbPreview');
+        const posterEl = document.getElementById('tmdbPoster');
+        if (poster) { posterEl.src = poster; posterEl.style.display = 'block'; } else { posterEl.style.display = 'none'; }
+        document.getElementById('tmdbPreviewTitle').textContent = `${title} (${year})`;
+        document.getElementById('tmdbPreviewMeta').textContent  = `${genres}${rating ? ' · ⭐ ' + rating : ''}`;
+        document.getElementById('tmdbPreviewDesc').textContent  = desc;
+        preview.style.display = 'block';
+
+        document.getElementById('logContent').innerHTML += `<br>✅ TMDB: <b>${title}</b> (${year}) — tmdb_id=${id} | imdb=${imdbId || 'N/A'}`;
+      } catch (e) {
+        alert("Erro ao carregar detalhes TMDB: " + e.message);
+      } finally {
+        btn.textContent = '🔍 Buscar no TMDB';
+        btn.disabled = false;
+      }
+    }
+
+    function clearTMDB() {
+      ['tmdb_id','imdb_id','cover_url','desc_val','year_val','director_val','cast_val','rating_val','trailer_val','genres_val','language_val']
+        .forEach(id => document.getElementById(id).value = '');
+      document.getElementById('tmdbPreview').style.display = 'none';
+      document.getElementById('tmdbResults').classList.add('hidden');
+    }
+
+    // ========================
+    // Start Job
+    // ========================
     async function startJob() {
       const formData = new FormData();
-
       formData.append('url', document.getElementById('magnetUrl').value);
+      
+      // Se for série, adiciona o vídeo selecionado
+      const isSeries = document.querySelector('input[name="type"]:checked').value === 'serie';
+      if (isSeries) {
+        const videoFile = document.getElementById('selectedVideo').value;
+        if (videoFile) {
+          formData.append('videoFile', videoFile);
+        }
+      }
 
+      const g = (id) => document.getElementById(id).value || null;
       const meta = {
-        title: document.getElementById('title').value,
-        genre: document.getElementById('genre').value,
-        type: document.querySelector('input[name="type"]:checked').value,
-        season: document.getElementById('season').value,
-        episode: document.getElementById('episode').value
+        title:       g('title'),
+        genre:       g('genre'),
+        type:        document.querySelector('input[name="type"]:checked').value,
+        season:      document.getElementById('season').value,
+        episode:     document.getElementById('episode').value,
+        // Dados TMDB
+        tmdb_id:     g('tmdb_id'),
+        imdb_id:     g('imdb_id'),
+        cover_url:   g('cover_url'),
+        description: g('desc_val'),
+        year:        g('year_val'),
+        director:    g('director_val'),
+        cast:        g('cast_val'),
+        rating:      g('rating_val'),
+        trailer:     g('trailer_val'),
+        genres:      g('genres_val'),
+        language:    g('language_val'),
       };
       formData.append('meta', JSON.stringify(meta));
 
@@ -293,36 +524,27 @@
       formData.append('selectedSubs', JSON.stringify(selectedSubs));
 
       const ptFile = document.getElementById('extSub_pt').files[0];
-      if(ptFile) {
-        formData.append('extSub_pt', ptFile);
-        console.log("Anexando legenda PT:", ptFile.name);
-      }
-
+      if(ptFile) formData.append('extSub_pt', ptFile);
       const enFile = document.getElementById('extSub_en').files[0];
-      if(enFile) {
-        formData.append('extSub_en', enFile);
-        console.log("Anexando legenda EN:", enFile.name);
-      }
+      if(enFile) formData.append('extSub_en', enFile);
 
       if(selectedAudios.length === 0) return alert("Selecione pelo menos 1 áudio!");
       if(!meta.title) return alert("Digite o título!");
+      if(isSeries && !document.getElementById('selectedVideo').value) return alert("Selecione um episódio!");
+      if(!meta.tmdb_id) {
+        const ok = confirm("Nenhum filme selecionado no TMDB.\nOs dados de capa, sinopse, elenco etc. ficarão vazios no banco.\n\nContinuar mesmo assim?");
+        if(!ok) return;
+      }
 
       document.getElementById('logArea').classList.remove('hidden');
       document.getElementById('logContent').innerHTML = "Enviando comando e arquivos...";
 
       try {
-        const res = await fetch('/api/jobs', {
-          method: 'POST',
-          body: formData
-        });
-
+        const res = await fetch('/api/jobs', { method: 'POST', body: formData });
         const data = await res.json();
-
         if(data.error) throw new Error(data.error);
-
         alert("Job iniciado com sucesso!\nID: " + data.id);
         document.getElementById('logContent').innerHTML += `<br>Job ID: ${data.id}<br>Destino R2: ${data.target}<br>Acompanhe no terminal.`;
-
       } catch (e) {
         alert("Erro ao iniciar job: " + e.message);
         document.getElementById('logContent').innerHTML += `<br><span class="text-red-500">Erro: ${e.message}</span>`;

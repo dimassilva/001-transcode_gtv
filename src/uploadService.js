@@ -7,34 +7,53 @@ import { NodeHttpHandler } from "@smithy/node-http-handler"; // <--- Importante 
 import https from "https"; 
 import mime from "mime-types";
 
-// --- CONFIGURAÇÃO DO R2 ---
-const R2_BUCKET = "cinesuper-storage";
-const R2_ENDPOINT = "https://6a07e1cc1b3be5e83613d9c0ff2a59c0.r2.cloudflarestorage.com";
-const R2_ACCESS_KEY = "096a159e1227a245762633ccefbcc30f";
-const R2_SECRET_KEY = "6e1eca863bbc5c9c0797e91bb1ad54c7a6cff94d15baaaa509a9bd485b973284";
-// --------------------------
+// --- CONFIGURAÇÃO DO R2 (GTV) ---
+// Lazy loading: as variáveis são lidas quando usadas, não no import time
+function getR2Credentials() {
+  const key = process.env.R2_ACCESS_KEY;
+  const secret = process.env.R2_SECRET_KEY;
+  
+  if (!key || !secret) {
+    throw new Error("R2_ACCESS_KEY ou R2_SECRET_KEY não estão configuradas. Defina em .env ou variáveis de ambiente.");
+  }
+  
+  return { key, secret };
+}
 
-// 1. AGENTE HTTPS OTIMIZADO (KEEP-ALIVE)
-// Mantém as conexões abertas para não perder tempo negociando SSL a cada arquivo
-const agent = new https.Agent({
-    maxSockets: 200, 
-    keepAlive: true, 
-});
+const R2_BUCKET = process.env.R2_BUCKET || "gtv";
+const R2_ENDPOINT = process.env.R2_ENDPOINT || "https://54bab46e8f6d55da65ddc135f08678b4.r2.cloudflarestorage.com";
+// ---------------------------------
 
-const s3 = new S3Client({
-  region: "auto",
-  endpoint: R2_ENDPOINT,
-  credentials: {
-    accessKeyId: R2_ACCESS_KEY,
-    secretAccessKey: R2_SECRET_KEY,
-  },
-  // Injeta o agente turbo
-  requestHandler: new NodeHttpHandler({
-      httpsAgent: agent,
-      connectionTimeout: 10000,
-      socketTimeout: 10000
-  }),
-});
+// S3 client será criado lazy também
+let s3Client = null;
+
+function getS3Client() {
+  if (s3Client) return s3Client;
+  
+  const { key, secret } = getR2Credentials();
+
+  const agent = new https.Agent({
+      maxSockets: 200, 
+      keepAlive: true, 
+  });
+
+  s3Client = new S3Client({
+    region: "auto",
+    endpoint: R2_ENDPOINT,
+    credentials: {
+      accessKeyId: key,
+      secretAccessKey: secret,
+    },
+    requestHandler: new NodeHttpHandler({
+        httpsAgent: agent,
+        connectionTimeout: 10000,
+        socketTimeout: 10000
+    }),
+  });
+  
+  return s3Client;
+}
+// ---------------------------------
 
 export function startLiveUpload(localFolder, cloudFolder) {
   console.log(`[R2] Monitorando (Modo Turbo 🚀): ${localFolder} -> ${cloudFolder}`);
@@ -82,7 +101,7 @@ export function startLiveUpload(localFolder, cloudFolder) {
       const contentType = mime.lookup(filePath) || 'application/octet-stream';
 
       const uploader = new Upload({
-        client: s3,
+        client: getS3Client(),
         params: {
           Bucket: R2_BUCKET,
           Key: r2Key,
@@ -101,21 +120,29 @@ export function startLiveUpload(localFolder, cloudFolder) {
       }
 
     } catch (err) {
-      // Retry Lógica (Mantive a segurança contra quedas)
-      const isNetworkError = err.code === 'EPROTO' || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT' || err.name === 'name';
-      const isBusy = err.code === 'EBUSY';
+      // Retry Lógica apenas para erros transitórios
+      const errorCode = err?.code || err?.name || 'UNKNOWN';
+      const errorMsg = err?.message || String(err);
+      
+      const isNetworkError = err?.code === 'EPROTO' || err?.code === 'ECONNRESET' || err?.code === 'ETIMEDOUT';
+      const isBusy = err?.code === 'EBUSY' || err?.code === 'EACCES';
+      const isThrottled = errorMsg?.includes('Slow Down') || errorMsg?.includes('RequestLimitExceeded');
+      const MAX_RETRIES = 5;
 
-      if ((isBusy || isNetworkError || err) && retryCount < 10) {
-          const delay = isBusy ? 1000 : 2000;
-          if(retryCount > 2) console.log(`[R2] Retentando ${fileName} (${retryCount}/10)...`);
+      if ((isBusy || isNetworkError || isThrottled) && retryCount < MAX_RETRIES) {
+          // Backoff exponencial: 1s, 2s, 4s, 8s, 16s
+          const delay = Math.min(1000 * Math.pow(2, retryCount), 16000);
+          if(retryCount > 1) console.log(`[R2] Retentando ${fileName} (${retryCount + 1}/${MAX_RETRIES})...`);
           
           // Devolve pro fim da fila
           queue.push({ filePath, retryCount: retryCount + 1 });
           
           // Espera um pouco antes de processar de novo (não trava os outros uploads)
           await new Promise(r => setTimeout(r, delay));
+      } else if (retryCount >= MAX_RETRIES) {
+          console.error(`[R2 Error] Limite de retries (${MAX_RETRIES}) atingido para ${fileName}: ${errorMsg}`);
       } else {
-          console.error(`[R2 Error] Falha fatal: ${fileName}`);
+          console.error(`[R2 Error] Falha (${errorCode}): ${fileName} | ${errorMsg}`);
       }
     }
   };
@@ -151,7 +178,7 @@ export async function uploadDirectoryRecursive(localFolder, cloudFolder) {
             try {
                 const fileStream = await fs.readFile(filePath);
                 const uploader = new Upload({
-                    client: s3,
+                    client: getS3Client(),
                     params: { Bucket: R2_BUCKET, Key: r2Key, Body: fileStream, ContentType: mime.lookup(filePath) },
                 });
                 await uploader.done();
