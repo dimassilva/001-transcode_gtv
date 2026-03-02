@@ -16,8 +16,8 @@ import { nanoid } from "nanoid";
 import multer from "multer";
 import fs from "node:fs/promises";
 
-import { getGenericStream, getLocalFileStream } from "./httpStream.js"; 
-import { probeAndReplayFromReadable } from "./probeStream.js";
+import { getGenericStream } from "./httpStream.js"; 
+import { probeAndReplayFromReadable, probeLocalFile } from "./probeStream.js";
 import { runTranscodeJob } from "./jobRunner.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -78,9 +78,10 @@ app.post("/api/probe-url", async (req, res) => {
 app.post("/api/probe-file", upload.single("sourceFile"), async (req, res) => {
   try {
     if (!req.file?.path) return res.status(400).json({ error: "arquivo obrigatório" });
-    const stream = await getLocalFileStream(req.file.path);
-    const { probe } = await probeAndReplayFromReadable({ inputReadable: stream, ffprobePath: FFPROBE });
-    stream.destroy();
+    const { probe } = await probeLocalFile({
+      filePath: req.file.path,
+      ffprobePath: FFPROBE,
+    });
     res.json({ probe });
   } catch (e) {
     res.status(500).json({ error: String(e.message) });

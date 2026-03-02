@@ -2,10 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 function fallbackBitrateKbpsByKey(key) {
-  // ✅ alinhado com seu jobrunner atual (1080=16000k, 4K=22000k)
-  if (key === "1080p") return 16000;
-  if (key === "2160p") return 22000;
-  return 16000;
+  // Alinhado com o jobrunner atual (single rendition: 1080p ou 720p)
+  if (key === "1080p") return 9000;
+  if (key === "720p") return 5000;
+  return 3500;
 }
 
 // H.264 Main + AAC-LC (descrição genérica e compatível)
@@ -57,10 +57,13 @@ export function writeMaster(outRoot, renditions, audios, subtitles, filename, ma
 
   // 3) Variantes de vídeo
   renditions.forEach((r) => {
-    const height = parseInt(String(r.key || "").replace("p", ""), 10) || r.height || 0;
+    const height =
+      (Number.isFinite(r.height) && r.height > 0 && r.height) ||
+      parseInt(String(r.key || "").replace("p", ""), 10) ||
+      0;
     if (maxRes !== null && height > maxRes) return;
 
-    const width = r.scaleW || Math.ceil(height * (16 / 9));
+    const width = r.width || r.scaleW || Math.ceil(height * (16 / 9));
 
     // prioridade: bitrateKbps -> bitrate -> fallback
     const kbps =

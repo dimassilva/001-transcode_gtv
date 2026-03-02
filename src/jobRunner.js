@@ -4,8 +4,8 @@ import { spawn } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
 import fs from "node:fs/promises";
 
-import { getGenericStream, getLocalFileStream } from "./httpStream.js";
-import { probeAndReplayFromReadable } from "./probeStream.js";
+import { getGenericStream } from "./httpStream.js";
+import { probeAndReplayFromReadable, probeLocalFile } from "./probeStream.js";
 import { buildOutputRoot, ensureTree } from "./paths.js";
 import { normalizeM3u8InPlace } from "./playlists.js";
 import { writeMaster } from "./master.js";
@@ -38,6 +38,12 @@ function clampInt(n, min, max) {
   if (x < min) return min;
   if (x > max) return max;
   return x;
+}
+
+function ensureEven(n, min = 2) {
+  const rounded = Math.floor(Number(n) || 0);
+  const even = rounded % 2 === 0 ? rounded : rounded - 1;
+  return Math.max(min, even);
 }
 
 function normalizeExitCode(exitCode) {
@@ -108,6 +114,16 @@ function formatErrorChain(err) {
     current = current?.cause;
   }
   return parts.join(" <- ");
+}
+
+function stderrTail(stderrText, maxLines = 25) {
+  if (!stderrText) return "";
+  const lines = String(stderrText)
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return "";
+  return lines.slice(-maxLines).join(" | ");
 }
 
 function getSupabaseConfig() {
@@ -348,9 +364,9 @@ async function upsertToSupabase({ meta, r2Prefix, r2PublicBase, duration, has4k 
 ========================= */
 
 function bitrateForKey(key) {
-  if (key === "1080p") return "16000k";
-  if (key === "2160p") return "22000k";
-  return "16000k";
+  if (key === "1080p") return "9000k";
+  if (key === "720p") return "5000k";
+  return "3500k";
 }
 
 function bitrateKbpsFromString(br) {
@@ -358,17 +374,68 @@ function bitrateKbpsFromString(br) {
   return Number.isFinite(n) && n > 0 ? n : 4500;
 }
 
-function selectRenditions1080AndMaybe4k({ srcW }) {
-  const br1080 = bitrateForKey("1080p");
-  const renditions = [{ key: "1080p", scaleW: 1920, bitrateKbps: bitrateKbpsFromString(br1080) }];
+function getSourceVideoBitrateKbps(probe) {
+  const v = getVideoStreamFromProbe(probe);
+  const candidates = [v?.bit_rate, probe?.format?.bit_rate];
+  for (const raw of candidates) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return Math.round(n / 1000);
+  }
+  return null;
+}
 
-  const isReal4k = srcW >= 3000;
-  if (isReal4k) {
-    const br4k = bitrateForKey("2160p");
-    renditions.push({ key: "2160p", scaleW: 3840, bitrateKbps: bitrateKbpsFromString(br4k) });
+function fitInsideNoUpscale(srcW, srcH, maxW, maxH) {
+  const w = Number(srcW);
+  const h = Number(srcH);
+  if (!(Number.isFinite(w) && w > 0 && Number.isFinite(h) && h > 0)) {
+    return { outW: maxW, outH: maxH };
   }
 
-  return { renditions, isReal4k };
+  const ratio = Math.min(maxW / w, maxH / h, 1);
+  const outW = ensureEven(w * ratio);
+  const outH = ensureEven(h * ratio);
+  return { outW, outH };
+}
+
+function pickVideoBitrateKbps({ key, sourceVideoBitrateKbps }) {
+  const defaults = {
+    "1080p": 9000,
+    "720p": 5000,
+  };
+
+  const defaultKbps = defaults[key] || 3500;
+  if (!(Number.isFinite(sourceVideoBitrateKbps) && sourceVideoBitrateKbps > 0)) return defaultKbps;
+
+  const sourceBased = key === "1080p"
+    ? sourceVideoBitrateKbps
+    : Math.round(sourceVideoBitrateKbps * 0.72);
+
+  const maxKbps = key === "1080p" ? 11000 : 6500;
+  return clampInt(sourceBased, 800, maxKbps);
+}
+
+function selectSingleRenditionBySource({ srcW, srcH, sourceVideoBitrateKbps }) {
+  const isFullHdSource = srcH === 1080;
+  const target = isFullHdSource
+    ? { key: "1080p", maxW: srcW > 0 ? srcW : 1920, maxH: 1080 }
+    : { key: "720p", maxW: 1280, maxH: 720 };
+
+  const { outW, outH } = fitInsideNoUpscale(srcW, srcH, target.maxW, target.maxH);
+  const bitrateKbps = pickVideoBitrateKbps({ key: target.key, sourceVideoBitrateKbps });
+
+  return {
+    renditions: [
+      {
+        key: target.key,
+        scaleW: outW,
+        scaleH: outH,
+        width: outW,
+        height: outH,
+        bitrateKbps,
+      },
+    ],
+    isFullHdSource,
+  };
 }
 
 /* =========================
@@ -385,7 +452,7 @@ function buildFilterComplex(renditions, thumbsEvery, workFps) {
   ];
 
   renditions.forEach((r, i) => {
-    parts.push(`[v${i}]scale=${r.scaleW}:-2:flags=bilinear[vs${i}]`);
+    parts.push(`[v${i}]scale=${r.scaleW}:${r.scaleH}:flags=bilinear[vs${i}]`);
   });
 
   parts.push(`[vthumb]fps=1/${thumbsEvery},scale=320:-1:flags=lanczos[thumbs]`);
@@ -479,17 +546,29 @@ export async function runTranscodeJob({
   const uploadWatcher = startLiveUpload(outRoot, r2DestFolder);
 
   // Probe
-  const resProbe = localFilePath
-    ? await getLocalFileStream(localFilePath)
-    : await getGenericStream(url, { headers }, videoFile);
-  const { probe, replayStream } = await probeAndReplayFromReadable({
-    inputReadable: resProbe,
-    ffprobePath,
-    onLog: (m) => onEvent?.({ kind: "log", step: "probe", line: m }),
-  });
-  try {
-    resProbe.destroy();
-  } catch {}
+  let probe;
+  let replayStream = null;
+
+  if (localFilePath) {
+    const probeRes = await probeLocalFile({
+      filePath: localFilePath,
+      ffprobePath,
+      onLog: (m) => onEvent?.({ kind: "log", step: "probe", line: m }),
+    });
+    probe = probeRes.probe;
+  } else {
+    const resProbe = await getGenericStream(url, { headers }, videoFile);
+    const probeRes = await probeAndReplayFromReadable({
+      inputReadable: resProbe,
+      ffprobePath,
+      onLog: (m) => onEvent?.({ kind: "log", step: "probe", line: m }),
+    });
+    probe = probeRes.probe;
+    replayStream = probeRes.replayStream;
+    try {
+      resProbe.destroy();
+    } catch {}
+  }
 
   const vStream = getVideoStreamFromProbe(probe);
   const srcW = Number(vStream?.width || probe?.width || 0);
@@ -506,14 +585,21 @@ export async function runTranscodeJob({
   const isNear60 = nearFps(fpsIn, 59.94, 0.25) || nearFps(fpsIn, 60, 0.25);
   const workFps = isNear60 ? 60 : fpsIn > 90 ? 60 : null;
 
-  const { renditions, isReal4k } = selectRenditions1080AndMaybe4k({ srcW });
-  const has4k = renditions.some((r) => r.key === "2160p") && isReal4k;
+  const sourceVideoBitrateKbps = getSourceVideoBitrateKbps(probe);
+  const { renditions, isFullHdSource } = selectSingleRenditionBySource({
+    srcW,
+    srcH,
+    sourceVideoBitrateKbps,
+  });
+  const has4k = false;
 
   onEvent?.({
     kind: "info",
     msg: `Fonte: ${srcW}x${srcH} | fps_in=${Number.isFinite(fpsIn) ? fpsIn.toFixed(3) : fpsIn} | fps_work=${
       workFps ?? "orig"
-    } | 4K_real=${isReal4k ? "sim" : "não"} | Saídas: ${renditions.map((r) => r.key).join(" + ")}`,
+    } | src_br=${sourceVideoBitrateKbps ? `${sourceVideoBitrateKbps}k` : "desconhecido"} | fullhd_exata=${
+      isFullHdSource ? "sim" : "nao"
+    } | Saida: ${renditions.map((r) => `${r.key} (${r.width}x${r.height}) @ ${r.bitrateKbps}k`).join(" + ")}`,
   });
 
   const filterComplex = buildFilterComplex(renditions, thumbsEvery, workFps);
@@ -528,7 +614,9 @@ export async function runTranscodeJob({
   const inputArgs = ["-y"];
   // Ajuda MUITO quando a fonte tem PTS estranho/negativo
   inputArgs.push("-fflags", "+genpts", "-avoid_negative_ts", "make_zero");
-  inputArgs.push("-i", "pipe:0");
+  const usePipeInput = !localFilePath;
+  const resolvedLocalInput = localFilePath ? path.resolve(localFilePath) : null;
+  inputArgs.push("-i", usePipeInput ? "pipe:0" : resolvedLocalInput);
 
   let inputIdx = 1;
   if (externalSubs) {
@@ -548,7 +636,7 @@ export async function runTranscodeJob({
     const outDir = path.join(outRoot, "video", r.key);
     await mkdir(outDir, { recursive: true });
 
-    const br = bitrateForKey(r.key);
+    const br = `${r.bitrateKbps || bitrateKbpsFromString(bitrateForKey(r.key))}k`;
     const max = maxrateForBitrate(br, 1.5);
     const buf = bufsizeForMaxrate(max, 2);
 
@@ -754,8 +842,8 @@ export async function runTranscodeJob({
 
   let replayUsed = false;
   const openInputStream = async () => {
+    if (!usePipeInput) return null;
     try {
-      if (localFilePath) return await getLocalFileStream(localFilePath);
       return await getGenericStream(url, { headers }, videoFile);
     } catch (e) {
       if (!replayUsed && replayStream) {
@@ -771,11 +859,13 @@ export async function runTranscodeJob({
     console.log(`[Debug] FFmpeg: ${ffmpegPath} ${args.join(" ")}`);
 
     let inputStream = null;
-    try {
-      inputStream = await openInputStream();
-    } catch (e) {
-      console.log(`[Stream Input Error] ${e.message}`);
-      return { exitCode: -1, error: e };
+    if (usePipeInput) {
+      try {
+        inputStream = await openInputStream();
+      } catch (e) {
+        console.log(`[Stream Input Error] ${e.message}`);
+        return { exitCode: -1, error: e };
+      }
     }
 
     const ff = spawn(ffmpegPath, args, { windowsHide: true });
@@ -789,8 +879,12 @@ export async function runTranscodeJob({
       if (msg.includes("speed=")) onEvent?.({ kind: "log", step: "ffmpeg", line: msg });
     });
 
-    inputStream.pipe(ff.stdin);
-    inputStream.on("error", (e) => console.log(`[Stream Input Error] ${e.message}`));
+    if (usePipeInput) {
+      inputStream.pipe(ff.stdin);
+      inputStream.on("error", (e) => console.log(`[Stream Input Error] ${e.message}`));
+    } else {
+      ff.stdin.end();
+    }
 
     const result = await new Promise((res) => {
       let settled = false;
@@ -806,9 +900,11 @@ export async function runTranscodeJob({
       });
     });
 
-    try {
-      inputStream.destroy();
-    } catch {}
+    if (inputStream) {
+      try {
+        inputStream.destroy();
+      } catch {}
+    }
 
     if (result.error) {
       console.log(`[FFmpeg] ${result.error.message}`);
@@ -824,11 +920,19 @@ export async function runTranscodeJob({
 
   const amfResult = await runFfmpegOnce({ args: amfArgs, label: "AMF" });
   if (amfResult.exitCode !== 0) {
+    const amfTail = stderrTail(amfResult.stderrText);
+    if (amfTail) console.log(`[FFmpeg AMF Tail] ${amfTail}`);
     console.log("[Job] AMF falhou. Tentando fallback libx264...");
     onEvent?.({ kind: "info", msg: "AMF falhou. Tentando fallback libx264." });
     const x264Result = await runFfmpegOnce({ args: x264Args, label: "libx264" });
     if (x264Result.exitCode !== 0) {
-      throw new Error(`FFmpeg falhou (AMF code=${amfResult.exitCode}, libx264 code=${x264Result.exitCode})`);
+      const x264Tail = stderrTail(x264Result.stderrText);
+      const details = [amfTail, x264Tail].filter(Boolean).join(" || ");
+      throw new Error(
+        `FFmpeg falhou (AMF code=${amfResult.exitCode}, libx264 code=${x264Result.exitCode})${
+          details ? ` | stderr: ${details}` : ""
+        }`
+      );
     }
   }
 
